@@ -1,0 +1,122 @@
+name: "CodeQL Feature Extraction"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract-features:
+    # 依然使用一个干净的、可控的Ubuntu 20.04环境作为基础
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+    
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+    # 步骤1: 检出master分支以获取我们的配置文件
+    - name: Checkout master branch for config files
+      uses: actions/checkout@v4
+      with:
+        ref: 'master' 
+        path: 'main'
+
+    # 步骤2: 检出impala的指定commit版本
+    - name: Checkout target source code (Impala)
+      uses: actions/checkout@v4
+      with:
+        repository: 'apache/impala'
+        ref: '9b8e43e9a1ae871e676cded8e9eddc90aa96f314'
+        path: 'source'
+
+    # ========================== 最终核心修改点 1 ==========================
+    # 步骤3: (新) 安装一个完整的、足以构建Impala的环境
+    - name: Install Full Build Environment
+      run: |
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        # 基础工具
+        apt-get install -y git ca-certificates wget unzip python3 python3-pip python3.8-venv
+        # C++ 依赖
+        apt-get install -y build-essential cmake libssl-dev protobuf-compiler libgflags-dev libleveldb-dev libprotobuf-dev libprotoc-dev
+        # Java 依赖 (Impala需要JDK 8 和 Maven)
+        apt-get install -y openjdk-8-jdk maven
+        # Python 依赖 (根据Impala文档)
+        python3 -m venv venv
+        source venv/bin/activate
+        pip install --upgrade pip
+        pip install numpy six
+        
+        # 下载并安装CodeQL CLI
+        wget https://github.com/github/codeql-cli-binaries/releases/download/v2.16.2/codeql-linux64.zip
+        unzip codeql-linux64.zip
+        mv codeql /usr/local/share/
+        chmod +x /usr/local/share/codeql/codeql
+        
+    # 步骤4: 创建一个包含完整环境设置的构建脚本
+    - name: Create build script
+      working-directory: ./source # 切换到impala源代码目录
+      run: |
+        cat <<'EOF' > build.sh
+        #!/bin/bash
+        set -ex # -e: 失败时退出, -x: 打印执行的命令
+        
+        # 设置所有需要的环境变量
+        export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+        export IMPALA_HOME=$(pwd)
+        source ../venv/bin/activate
+        
+        # 运行官方的构建脚本来准备所有生成代码等
+        # -skiptests 和 -noclean 可以加速这个过程
+        ./buildall.sh -skiptests -noclean
+        EOF
+        chmod +x build.sh
+
+    # ========================== 最终核心修改点 2 ==========================
+    # 步骤5: 创建CodeQL数据库，并执行我们准备好的构建脚本
+    - name: Create CodeQL database
+      run: |
+        # 使用 --command 来运行我们的脚本，CodeQL会追踪所有子进程
+        /usr/local/share/codeql/codeql database create ./codeql-database --language=cpp,java --source-root=./source --command="./source/build.sh"
+
+    # 步骤6: 升级数据库
+    - name: Upgrade CodeQL database
+      run: /usr/local/share/codeql/codeql database upgrade ./codeql-database
+
+    # 步骤7: 安装查询依赖包
+    - name: Install CodeQL packs
+      run: /usr/local/share/codeql/codeql pack install ./main/.github/codeql-queries
+
+    # 步骤8: 运行分析
+    - name: Perform CodeQL Analysis and decode results
+      run: /usr/local/share/codeql/codeql database analyze ./codeql-database ./main/.github/codeql-queries --format=csv --output=features.csv
+
+    # 步骤9: 将CSV转换为JSON
+    - name: Convert CSV to JSON
+      run: |
+        # ... (Python脚本内容保持不变) ...
+        cat <<'PY_EOF' > csv_to_json.py
+        import csv, json, sys; from collections import defaultdict
+        def csv_to_json(csv_path, json_path):
+            features = defaultdict(set)
+            try:
+                with open(csv_path,'r',newline='',encoding='utf-8') as f:
+                    r=csv.reader(f);next(r,None)
+                    for row in r:
+                        if len(row)==3: features[row[0]].add(row[2])
+            except FileNotFoundError: print(f"W: CSV '{csv_path}' not found.")
+            out={f:sorted(list(fs)) for f,fs in features.items()}
+            with open(json_path,'w',encoding='utf-8') as f:json.dump(out,f,indent=2)
+            print(f"OK: Processed {len(out)} files.")
+        if __name__=="__main__":csv_to_json(sys.argv[1],sys.argv[2])
+        PY_EOF
+        python3 csv_to_json.py features.csv extracted_features.json
+        
+    # 步骤10: 上传JSON文件
+    - name: Upload final JSON artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: extracted-features-json
+        path: extracted_features.json
